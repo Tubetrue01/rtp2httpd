@@ -18,12 +18,16 @@ import { type EPGData, fillEPGGaps, getCurrentProgram, getEPGChannelId, loadEPG 
 import type { Locale } from "../lib/locale";
 import { buildCatchupSegments, clampCatchupStartTime, parseM3U } from "../lib/m3u-parser";
 import {
+  getAutoDeinterlace,
   getLastChannelId,
   getLastSourceIndex,
+  getPictureEnhancement,
   getSeamlessSwitch,
   getSidebarVisible,
+  saveAutoDeinterlace,
   saveLastChannelId,
   saveLastSourceIndex,
+  savePictureEnhancement,
   saveSeamlessSwitch,
   saveSidebarVisible,
 } from "../lib/player-storage";
@@ -56,6 +60,8 @@ function PlayerPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768);
   const [seamlessSwitch, setSeamlessSwitch] = useState(() => getSeamlessSwitch());
+  const [autoDeinterlace, setAutoDeinterlace] = useState(() => getAutoDeinterlace());
+  const [pictureEnhancement, setPictureEnhancement] = useState(() => getPictureEnhancement());
   const pageContainerRef = useRef<HTMLDivElement>(null);
 
   // Track stream start time - the absolute time position when current stream started
@@ -338,6 +344,16 @@ function PlayerPage() {
     saveSeamlessSwitch(enabled);
   }, []);
 
+  const handleAutoDeinterlaceChange = useCallback((enabled: boolean) => {
+    setAutoDeinterlace(enabled);
+    saveAutoDeinterlace(enabled);
+  }, []);
+
+  const handlePictureEnhancementChange = useCallback((enabled: boolean) => {
+    setPictureEnhancement(enabled);
+    savePictureEnhancement(enabled);
+  }, []);
+
   const handleToggleSidebar = useCallback(() => {
     setShowSidebar((prev) => {
       const newState = !prev;
@@ -356,10 +372,25 @@ function PlayerPage() {
           onThemeChange={setTheme}
           seamlessSwitch={seamlessSwitch}
           onSeamlessSwitchChange={handleSeamlessSwitchChange}
+          autoDeinterlace={autoDeinterlace}
+          onAutoDeinterlaceChange={handleAutoDeinterlaceChange}
+          pictureEnhancement={pictureEnhancement}
+          onPictureEnhancementChange={handlePictureEnhancementChange}
         />
       </div>
     );
-  }, [locale, theme, seamlessSwitch, setLocale, setTheme, handleSeamlessSwitchChange]);
+  }, [
+    locale,
+    theme,
+    seamlessSwitch,
+    autoDeinterlace,
+    pictureEnhancement,
+    setLocale,
+    setTheme,
+    handleSeamlessSwitchChange,
+    handleAutoDeinterlaceChange,
+    handlePictureEnhancementChange,
+  ]);
 
   // Main UI content
   const mainContent = (
@@ -387,6 +418,8 @@ function PlayerPage() {
             onToggleSidebar={handleToggleSidebar}
             onFullscreenToggle={handleFullscreenToggle}
             seamlessSwitch={seamlessSwitch}
+            autoDeinterlace={autoDeinterlace}
+            pictureEnhancement={pictureEnhancement}
             activeSourceIndex={activeSourceIndex}
             onSourceChange={handleSourceChange}
             onPlaybackStarted={handlePlaybackStarted}
