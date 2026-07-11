@@ -48,15 +48,21 @@ interface RenderTarget {
  * Rendering and presentation are decoupled for bwdif: both fields of a frame
  * are rendered up front when the frame arrives, the first field is presented
  * immediately, and the second field is presented by a requestAnimationFrame
- * clock on the vsync nearest `expectedDisplayTime + frameDuration / 2`. A
- * setTimeout here would drift against the vsync grid and make each field's
- * on-screen duration irregular, which reads as motion judder.
+ * clock on the vsync nearest half a frame duration after the first field's
+ * estimated display time (see `secondFieldPresentAt`). A setTimeout here
+ * would drift against the vsync grid and make each field's on-screen
+ * duration irregular, which reads as motion judder.
  */
 export class VideoRenderer {
   private readonly video: HTMLVideoElement;
   private readonly canvas: HTMLCanvasElement;
   private gl: WebGL2RenderingContext | null = null;
+  /** Active source-stage filter; compiled filters remain cached while inactive. */
   private stageFilter: VideoFilter | null = null;
+  /** Context-bound source-stage programs, compiled at most once per context. */
+  private readonly stageFilterCache = new Map<RenderStageName, VideoFilter>();
+  /** Stage programs that failed to initialise are not retried until context restoration. */
+  private readonly stageFilterInitFailures = new Set<RenderStageName>();
   private stageTarget: RenderTarget | null = null;
   /** Ring of frame textures: [0] = newest, [1..] = history (most recent first). */
   private textures: WebGLTexture[] = [];
@@ -69,6 +75,7 @@ export class VideoRenderer {
   private readonly onContextRestored?: () => void;
 
   private passthroughPresenter: PassthroughPresenter | null = null;
+  private passthroughInitFailed = false;
   private enhancementFilters: VideoFilter[] = [];
   /** FSR (EASU+RCAS) upscale presenter for the enhancement path. */
   private upscalePresenter: Presenter | null = null;
@@ -76,6 +83,9 @@ export class VideoRenderer {
   private enhancementTargets: [RenderTarget | null, RenderTarget | null] = [null, null];
   private pictureEnhancementEnabled = true;
   private enhancementInitFailed = false;
+  /** Last uploaded frame size; enables texSubImage2D on subsequent uploads. */
+  private uploadedWidth = 0;
+  private uploadedHeight = 0;
 
   /**
    * Fully filtered second-field output of the current frame, rendered at
@@ -190,8 +200,7 @@ export class VideoRenderer {
   setPictureEnhancementEnabled(enabled: boolean): void {
     if (this.pictureEnhancementEnabled === enabled) return;
     this.pictureEnhancementEnabled = enabled;
-    this.enhancementInitFailed = false;
-    if (!enabled) this.teardownEnhancementResources();
+    if (!enabled) this.releaseEnhancementTargets();
     this.primeCanvas();
   }
 
@@ -216,6 +225,14 @@ export class VideoRenderer {
     return true;
   }
 
+  /** Reset source-specific state while retaining this canvas's context and compiled programs. */
+  resetStream(fieldOrder: FieldOrder = "tff"): void {
+    this.stageName = "passthrough";
+    this.stageFilter = null;
+    this.fieldOrder = fieldOrder;
+    this.releaseStreamResources();
+  }
+
   /** Start the frame loop with the given source stage. Safe to call repeatedly. */
   start(stageName: RenderStageName = this.stageName, fieldOrder: FieldOrder = "tff"): boolean {
     this.fieldOrder = fieldOrder;
@@ -232,7 +249,7 @@ export class VideoRenderer {
     if (!gl) return false;
 
     if (!this.ensurePassthroughPresenter() || !this.ensureStageFilter(stageName)) {
-      this.teardownFilters();
+      this.releaseStreamResources();
       return false;
     }
 
@@ -248,7 +265,7 @@ export class VideoRenderer {
     if (!this.running) return;
     this.running = false;
     this.cancelFrameCallbacks();
-    this.teardownFilters();
+    this.releaseStreamResources();
     Log.i(TAG, "Stopped");
   }
 
@@ -262,7 +279,13 @@ export class VideoRenderer {
   }
 
   destroy(): void {
-    this.stop();
+    if (this.running) {
+      this.stop();
+    } else {
+      this.cancelFrameCallbacks();
+      this.releaseStreamResources();
+    }
+    this.destroyContextResources();
     this.canvas.removeEventListener("webglcontextlost", this.handleContextLost);
     this.canvas.removeEventListener("webglcontextrestored", this.handleContextRestored);
     this.resizeObserver?.disconnect();
@@ -294,6 +317,7 @@ export class VideoRenderer {
 
   private ensurePassthroughPresenter(): boolean {
     if (this.passthroughPresenter) return true;
+    if (this.passthroughInitFailed) return false;
     const gl = this.ensureContext();
     if (!gl) return false;
     const presenter = new PassthroughPresenter();
@@ -302,6 +326,7 @@ export class VideoRenderer {
     } catch (err) {
       Log.e(TAG, "Failed to init canvas presenter:", err);
       presenter.destroy(gl);
+      this.passthroughInitFailed = true;
       return false;
     }
     this.passthroughPresenter = presenter;
@@ -311,11 +336,16 @@ export class VideoRenderer {
   private ensureStageFilter(name: RenderStageName): boolean {
     if (name === "passthrough") {
       // No GL source stage needed: the uploaded frame texture is presented directly.
-      if (this.stageFilter && this.gl && !this.contextLost) this.stageFilter.destroy(this.gl);
       this.stageFilter = null;
       return true;
     }
     if (this.stageFilter?.name === name) return true;
+    const cached = this.stageFilterCache.get(name);
+    if (cached) {
+      this.stageFilter = cached;
+      return true;
+    }
+    if (this.stageFilterInitFailures.has(name)) return false;
     const gl = this.ensureContext();
     if (!gl) return false;
 
@@ -330,10 +360,11 @@ export class VideoRenderer {
     } catch (err) {
       Log.e(TAG, `Failed to init render filter '${name}':`, err);
       filter.destroy(gl);
+      this.stageFilterInitFailures.add(name);
       return false;
     }
 
-    if (this.stageFilter) this.stageFilter.destroy(gl);
+    this.stageFilterCache.set(name, filter);
     this.stageFilter = filter;
     return true;
   }
@@ -382,48 +413,79 @@ export class VideoRenderer {
     }
   }
 
-  private teardownEnhancementResources(): void {
+  /** Release large enhancement targets while retaining filters and presenter programs. */
+  private releaseEnhancementTargets(): void {
     const gl = this.gl;
     if (gl && !this.contextLost) {
-      for (const filter of this.enhancementFilters) filter.destroy(gl);
-      this.upscalePresenter?.destroy(gl);
       for (const target of this.enhancementTargets) this.deleteRenderTarget(target);
+      this.upscalePresenter?.releaseTransientResources(gl);
     }
-    this.enhancementFilters = [];
-    this.upscalePresenter = null;
     this.enhancementTargets = [null, null];
   }
 
-  private teardownFilters(): void {
+  /** Release all source-specific textures/FBOs while keeping context-bound programs alive. */
+  private releaseStreamResources(): void {
+    this.stopPresentClock();
+    this.pendingSecondField = null;
+
     const gl = this.gl;
     if (gl && !this.contextLost) {
-      if (this.stageFilter) this.stageFilter.destroy(gl);
-      this.passthroughPresenter?.destroy(gl);
       this.deleteRenderTarget(this.stageTarget);
       this.deleteRenderTarget(this.secondFieldTarget);
     }
-    this.teardownEnhancementResources();
+    this.releaseEnhancementTargets();
     this.clearTextureRing();
-    this.stageFilter = null;
-    this.passthroughPresenter = null;
     this.stageTarget = null;
     this.secondFieldTarget = null;
-    this.pendingSecondField = null;
+    this.lastMediaTime = -1;
+    this.frameDurationEstimateMs = 40;
+    this.lastPresentClockTs = -1;
+    this.refreshDeltasMs = [];
+    this.refreshIntervalMs = 1000 / 60;
+  }
+
+  /** Permanently release every GL object owned by this renderer. Called only by destroy(). */
+  private destroyContextResources(): void {
+    const gl = this.gl;
+    if (gl && !this.contextLost) {
+      for (const filter of this.stageFilterCache.values()) filter.destroy(gl);
+      this.passthroughPresenter?.destroy(gl);
+      for (const filter of this.enhancementFilters) filter.destroy(gl);
+      this.upscalePresenter?.destroy(gl);
+    }
+    this.stageFilterCache.clear();
+    this.stageFilterInitFailures.clear();
+    this.stageFilter = null;
+    this.passthroughPresenter = null;
+    this.passthroughInitFailed = false;
+    this.enhancementFilters = [];
+    this.upscalePresenter = null;
+    this.enhancementTargets = [null, null];
     this.enhancementInitFailed = false;
   }
 
   /** Drop all references to GL objects without deleting them (context is gone). */
   private forgetGlResources(): void {
     this.textures = [];
+    this.uploadedWidth = 0;
+    this.uploadedHeight = 0;
     this.stageTarget = null;
     this.secondFieldTarget = null;
     this.pendingSecondField = null;
     this.stageFilter = null;
+    this.stageFilterCache.clear();
+    this.stageFilterInitFailures.clear();
     this.passthroughPresenter = null;
+    this.passthroughInitFailed = false;
     this.enhancementFilters = [];
     this.upscalePresenter = null;
     this.enhancementTargets = [null, null];
     this.enhancementInitFailed = false;
+    this.lastMediaTime = -1;
+    this.frameDurationEstimateMs = 40;
+    this.lastPresentClockTs = -1;
+    this.refreshDeltasMs = [];
+    this.refreshIntervalMs = 1000 / 60;
   }
 
   private clearTextureRing(): void {
@@ -433,6 +495,8 @@ export class VideoRenderer {
       }
     }
     this.textures = [];
+    this.uploadedWidth = 0;
+    this.uploadedHeight = 0;
   }
 
   private cancelFrameCallbacks(): void {
@@ -449,9 +513,9 @@ export class VideoRenderer {
   }
 
   /**
-   * Presentation clock: one requestAnimationFrame per display refresh while a
-   * second field is queued. Each tick presents the queued field once its
-   * target display time falls within the upcoming vsync interval, so field
+   * Presentation clock: one requestAnimationFrame per display refresh while
+   * playing. In the bwdif stage each tick presents the queued second field once
+   * its target display time falls within the upcoming vsync interval, so field
    * flips always land on the vsync grid instead of a timer's completion point.
    */
   private startPresentClock(): void {
@@ -525,15 +589,15 @@ export class VideoRenderer {
   }
 
   private scheduleFrame(): void {
-    this.rvfcHandle = this.video.requestVideoFrameCallback((_now, metadata) => {
+    this.rvfcHandle = this.video.requestVideoFrameCallback((now, metadata) => {
       this.rvfcHandle = 0;
       if (!this.running) return;
-      this.processFrame(metadata);
+      this.processFrame(now, metadata);
       if (this.running) this.scheduleFrame();
     });
   }
 
-  private processFrame(metadata: VideoFrameCallbackMetadata): void {
+  private processFrame(now: DOMHighResTimeStamp, metadata: VideoFrameCallbackMetadata): void {
     const gl = this.gl;
     if (!gl || this.contextLost) return;
 
@@ -555,7 +619,7 @@ export class VideoRenderer {
       const firstField = this.fieldOrder === "tff" ? 0 : 1;
       this.drawCurrentOutput(firstField);
       if (!this.video.paused && frameDurationMs > 10) {
-        this.queueSecondField(firstField === 0 ? 1 : 0, metadata.expectedDisplayTime + frameDurationMs / 2);
+        this.queueSecondField(firstField === 0 ? 1 : 0, this.secondFieldPresentAt(now, frameDurationMs));
       }
     } else {
       this.drawCurrentOutput(0);
@@ -569,6 +633,24 @@ export class VideoRenderer {
 
   private lastMediaTime = -1;
   private frameDurationEstimateMs = 40;
+
+  /**
+   * Target display time for the second field: half a frame after the first.
+   *
+   * Derived purely from the rVFC callback timestamp: the first field drawn in
+   * this rendering update reaches the screen roughly one refresh from `now`,
+   * so the second field is due `frameDuration / 2` after that. `now` shares
+   * the rAF/performance.now() timeline the presentation clock ticks on, and
+   * `refreshIntervalMs` is the median-estimated interval of that clock, so
+   * this holds on any display refresh rate. `metadata.expectedDisplayTime`
+   * would be the spec'd source for the same instant, but Safari reports it on
+   * an unrelated clock domain (off by days), which made the presentation
+   * clock's vsync test always pass and collapsed 50i to an effective 25p —
+   * so it is deliberately not used.
+   */
+  private secondFieldPresentAt(now: DOMHighResTimeStamp, frameDurationMs: number): number {
+    return now + this.refreshIntervalMs + frameDurationMs / 2;
+  }
 
   /** Estimate the source frame duration from consecutive rVFC mediaTime values. */
   private frameDurationMs(metadata: VideoFrameCallbackMetadata): number {
@@ -603,7 +685,15 @@ export class VideoRenderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, target);
     try {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.video);
+      // texSubImage2D avoids reallocating GPU storage when the frame size is unchanged
+      // (steady-state IPTV). Fall back to texImage2D on first upload or size change.
+      if (!isNew && this.uploadedWidth === width && this.uploadedHeight === height) {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGB, gl.UNSIGNED_BYTE, this.video);
+      } else {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.video);
+        this.uploadedWidth = width;
+        this.uploadedHeight = height;
+      }
     } catch (err) {
       Log.w(TAG, "Frame texture upload failed:", err);
       if (isNew) gl.deleteTexture(target);
