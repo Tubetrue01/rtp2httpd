@@ -1,11 +1,12 @@
 import { markPlaybackUnlocked, PCMAudioPlayer } from "../audio/pcm-audio-player";
 import type { PlayerConfig } from "../config";
-import type { PlayerImpl, PlayerSegment } from "../types";
+import { PlayerErrors } from "../errors";
+import { type LiveSessionAnchor, lagBehindLiveEdge } from "../timeline/wall-clock";
+import type { MSEPlaybackController, PlayerSegment } from "../types";
 import type { WorkerCommand, WorkerEvent } from "../worker/messages";
 import TransmuxWorker from "../worker/transmux-worker.ts?worker&inline";
 import { setupLiveSync } from "./live-sync";
-import { createMSE, type MSE } from "./mse";
-import { type LiveSessionAnchor, lagBehindLiveEdge } from "./wall-clock";
+import { createMediaSourceController, type MediaSourceController } from "./media-source";
 
 /** Check if a given time position is within any buffered range of the video element. */
 export function isBuffered(video: HTMLMediaElement, seconds: number): boolean {
@@ -26,12 +27,12 @@ const HLS_URL_RE = /\.m3u8?($|\?)/i;
 
 type SourceMode = "continuous-live-ts" | "static-ts-list" | "hls";
 
-export function createMpegtsPlayer(
+export function createMSEPlaybackController(
   video: HTMLVideoElement,
   config: PlayerConfig,
   seekHandlers: Set<(s: number) => void>,
-): PlayerImpl {
-  let mse: MSE | null = null;
+): MSEPlaybackController {
+  let mse: MediaSourceController | null = null;
   let worker: Worker | null = null;
   let workerInitialized = false;
   let pendingSegments: PlayerSegment[] | null = null;
@@ -64,14 +65,14 @@ export function createMpegtsPlayer(
         // (live edge for live, current position for catchup) takes over.
         impl.onError?.({
           category: "media",
-          detail: "AudioResyncFailed",
+          detail: PlayerErrors.AUDIO_RESYNC_FAILED,
           info: "Audio could not re-anchor to the video clock after an interruption",
         });
       };
       pcmPlayer.onStartupSyncFailed = () => {
         impl.onError?.({
           category: "media",
-          detail: "AudioStartupSyncFailed",
+          detail: PlayerErrors.AUDIO_STARTUP_SYNC_FAILED,
           info: "Software-decoded audio could not establish an initial shared timeline with video",
         });
       };
@@ -370,7 +371,7 @@ export function createMpegtsPlayer(
 
   /** Create (or recreate) MSE and attach to video element. */
   function initMSE(): void {
-    mse = createMSE(video, config);
+    mse = createMediaSourceController(video, config);
     if (sourceMode === "continuous-live-ts") {
       mse.setDuration(Infinity);
     }
@@ -415,7 +416,7 @@ export function createMpegtsPlayer(
         // Unexpected closure while visible: surface as an error so the app retries
         impl.onError?.({
           category: "media",
-          detail: "MediaSourceClosed",
+          detail: PlayerErrors.MEDIA_SOURCE_CLOSED,
           info: "MediaSource was closed unexpectedly",
         });
       }
@@ -424,9 +425,20 @@ export function createMpegtsPlayer(
     };
 
     mse.onError = (info) => {
+      if (info.name === "NotSupportedError" && info.track) {
+        impl.onError?.({
+          category: "media",
+          detail: PlayerErrors.CODEC_UNSUPPORTED,
+          info: info.msg,
+          code: info.code,
+          track: info.track,
+          codec: info.codec,
+        });
+        return;
+      }
       impl.onError?.({
         category: "media",
-        detail: "MediaMSEError",
+        detail: PlayerErrors.MEDIA_MSE_ERROR,
         info: info.msg,
       });
     };
@@ -449,7 +461,7 @@ export function createMpegtsPlayer(
   video.addEventListener("play", onVideoPlay);
   video.addEventListener("timeupdate", onVideoTimeUpdate);
 
-  const impl: PlayerImpl = {
+  const impl: MSEPlaybackController = {
     onError: null,
 
     loadSegments(segments: PlayerSegment[]) {
